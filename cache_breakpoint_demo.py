@@ -5,16 +5,19 @@ Demo: Prompt Cache Equivalence
 Compares two caching strategies for a production safety-classifier use case:
 
   1. GPT-5.6-sol   → explicit prompt_cache_breakpoint (Responses API)
-  2. FW-Kimi-K3-3  → Fireworks session affinity (x-session-affinity header)
-                     Routes all requests for the same session to the same
-                     inference replica, so the KV-cache of the long system
-                     prompt is reused automatically — no explicit breakpoint
-                     field required.
+  2. FW-Kimi-K3-3  → prompt_cache_key (Chat Completions request body)
+                     Fireworks prefix caching is automatic (longest-prefix
+                     match). prompt_cache_key is the routing/affinity key:
+                     requests sharing a key are routed to the same replica(s),
+                     where the cached system-prompt KV state lives. It is
+                     equivalent to the x-session-affinity header (the header
+                     takes precedence if both are sent).
 
 Both achieve the same outcome: the static system prompt is cached after the
 first request and only the short user message is processed on subsequent calls.
 
-Microsoft Foundry endpoint: https://ganacfoundryeastus.services.ai.azure.com/api/projects/proj-default
+Configure via environment: FOUNDRY_KEY (required), FOUNDRY_ENDPOINT,
+KIMI_MODEL, GPT_MODEL (see .env.example).
 """
 
 import os
@@ -26,11 +29,18 @@ from openai import OpenAI
 # ── Foundry config ─────────────────────────────────────────────────────────────
 # Set FOUNDRY_KEY in your environment (see .env.example). Never commit keys.
 FOUNDRY_KEY      = os.environ["FOUNDRY_KEY"]
-FOUNDRY_ENDPOINT = "https://ganacfoundryeastus.services.ai.azure.com/api/projects/proj-default"
+FOUNDRY_ENDPOINT = os.environ.get(
+    "FOUNDRY_ENDPOINT",
+    "https://ganacfoundryeastus.services.ai.azure.com/api/projects/proj-default",
+).rstrip("/")
 V1_BASE          = f"{FOUNDRY_ENDPOINT}/openai/v1"   # no api-version — Microsoft Foundry /v1 path
 
-KIMI_MODEL = "FW-Kimi-K3-3"
-GPT_MODEL  = "gpt-5.6-sol"
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "FW-Kimi-K3-3")
+GPT_MODEL  = os.environ.get("GPT_MODEL", "gpt-5.6-sol")
+
+# Set to False on first 400 "prompt_cache_breakpoint is not supported on this
+# model" — later calls then rely on implicit prefix caching with identical prefixes.
+_GPT_BREAKPOINT_SUPPORTED = True
 
 # ── Safety-classifier system prompt (production-realistic length, 1200+ tokens) ─
 # Caching requires ≥1024 tokens on GPT-5.6 and benefits Fireworks KV-cache too.
@@ -194,32 +204,36 @@ def _extract_label(text: str) -> str:
 # GPT-5.6-sol — Responses API with prompt_cache_breakpoint
 # ══════════════════════════════════════════════════════════════════════════════
 
-def call_gpt_responses_api(user_text: str, idx: int) -> dict:
+def call_gpt_responses_api(user_text: str, idx: int, use_breakpoint: bool = True) -> dict:
     """
     Sends a request in the Responses API format — exactly the customer's sample.
     The prompt_cache_breakpoint marks where the static system prompt ends so the
     model server can cache everything before that point.
+
+    use_breakpoint=False omits the breakpoint field — fallback for models that
+    reject it (e.g. GPT-5.4-nano: "prompt_cache_breakpoint is not supported on
+    this model"). Those models still prefix-cache implicitly when the prompt
+    prefix is identical across calls.
     """
     url = f"{V1_BASE}/responses"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {FOUNDRY_KEY}",
     }
+    system_content = {
+        "type": "input_text",
+        "text": SYSTEM_PROMPT,
+    }
+    if use_breakpoint:
+        system_content["prompt_cache_breakpoint"] = {"mode": "explicit"}
+
     payload = {
         "model": GPT_MODEL,
         "input": [
             {
                 "type": "message",          # required by Responses API
                 "role": "developer",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": SYSTEM_PROMPT,
-                        "prompt_cache_breakpoint": {
-                            "mode": "explicit"
-                        }
-                    }
-                ]
+                "content": [system_content]
             },
             {
                 "type": "message",
@@ -234,6 +248,8 @@ def call_gpt_responses_api(user_text: str, idx: int) -> dict:
         ],
         "stream": False,
         "store": False,
+        # GPT-5.x rejects max_tokens; Responses API uses max_output_tokens.
+        "max_output_tokens": 512,
     }
 
     t0 = time.perf_counter()
@@ -241,7 +257,16 @@ def call_gpt_responses_api(user_text: str, idx: int) -> dict:
     elapsed = time.perf_counter() - t0
 
     if resp.status_code != 200:
-        return {"error": resp.status_code, "body": resp.text, "latency_s": elapsed, "call": idx + 1}
+        body = resp.text
+        # One-shot fallback: retry without the breakpoint field when the model
+        # rejects it, and remember so later calls skip the failing variant.
+        if use_breakpoint and "prompt_cache_breakpoint" in body:
+            global _GPT_BREAKPOINT_SUPPORTED
+            _GPT_BREAKPOINT_SUPPORTED = False
+            print(f"  [info] {GPT_MODEL} does not support prompt_cache_breakpoint — "
+                  "falling back to implicit prefix caching (identical stable prefix).")
+            return call_gpt_responses_api(user_text, idx, use_breakpoint=False)
+        return {"error": resp.status_code, "body": body, "latency_s": elapsed, "call": idx + 1}
 
     data = resp.json()
 
@@ -287,14 +312,15 @@ def run_gpt_demo():
     print(f"  MODEL: {GPT_MODEL}  |  Strategy: prompt_cache_breakpoint (Responses API)")
     print(SEPARATOR)
     print(
-        "  The static system prompt is marked with prompt_cache_breakpoint mode='explicit'.\n"
-        "  After the first call the server caches that prefix; subsequent calls skip\n"
-        "  re-encoding it — only the short user message is processed.\n"
+        "  The static system prompt is marked with prompt_cache_breakpoint mode='explicit'\n"
+        "  when the model supports it. After the first call the server caches that\n"
+        "  prefix; subsequent calls skip re-encoding it. If the model rejects the\n"
+        "  field, the demo falls back to implicit prefix caching (identical prefix).\n"
     )
 
     results = []
     for i, msg in enumerate(TEST_MESSAGES):
-        result = call_gpt_responses_api(msg, i)
+        result = call_gpt_responses_api(msg, i, use_breakpoint=_GPT_BREAKPOINT_SUPPORTED)
         results.append(result)
 
         if "error" in result:
@@ -319,9 +345,11 @@ def run_gpt_demo():
 # FW-Kimi-K3-3 — Chat Completions with prompt_cache_key
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Stable key that names the cache bucket for the system-prompt prefix.
-# All requests sharing this key reuse the same cached KV state, regardless
-# of which replica they land on — no sticky routing needed.
+# Stable routing/affinity key for the system-prompt prefix. Fireworks KV cache
+# is replica-local; requests sharing this key are routed to the same replica(s)
+# so the cached prefix is reused. One key is right at demo scale — at high
+# request rates, shard it (e.g. f"safety-classifier-v1-{i % N}") so traffic
+# spreads across N replicas instead of concentrating on a few.
 KIMI_CACHE_KEY = "safety-classifier-v1"
 
 
@@ -337,10 +365,10 @@ def call_kimi_cache_key(
 ) -> dict:
     """
     Chat Completions with prompt_cache_key in the request body.
-    Fireworks uses the key to store and retrieve the KV-cache for the common
-    system-prompt prefix. Every request with the same key gets cache reuse
-    without needing sticky routing — a direct analogue of prompt_cache_breakpoint,
-    expressed as a body field instead of a per-content marker.
+    Prefix caching is automatic; the key routes requests that share it to the
+    same replica(s) so the cached system-prompt KV state is reused. Same
+    outcome as prompt_cache_breakpoint, expressed as a body field instead of a
+    per-content marker.
     """
     t0 = time.perf_counter()
     try:
@@ -390,14 +418,12 @@ def run_kimi_demo():
     print(f"  MODEL: {KIMI_MODEL}  |  Strategy: prompt_cache_key (Chat Completions)")
     print(SEPARATOR)
     print(
-        "  prompt_cache_key names the cache bucket for the system-prompt prefix.\n"
-        "  Every request carrying the same key reuses the cached KV state — no\n"
-        "  sticky routing or header changes needed. Direct analogue of GPT's\n"
-        "  prompt_cache_breakpoint, expressed as a body field.\n"
+        "  Prefix caching is automatic. prompt_cache_key routes requests that\n"
+        "  share it to the same replica(s), where the cached KV state lives — one\n"
+        "  body field, no header changes. Same outcome as GPT's\n"
+        "  prompt_cache_breakpoint.\n"
         "\n"
-        "  NOTE: The Microsoft Foundry gateway does not surface cached_tokens in the\n"
-        "  usage response for this model. Cache hits appear as latency reduction\n"
-        "  vs the cold baseline.\n"
+        "  Cache hits are reported in usage.prompt_tokens_details.cached_tokens.\n"
     )
     print(f"  Cache key (stable per classifier version): {KIMI_CACHE_KEY}\n")
 
@@ -417,14 +443,14 @@ def run_kimi_demo():
         if "error" in result:
             print(f"  Call {i+1}: ERROR — {result['error'][:120]}")
         else:
-            speedup = cold_ms / result["latency_s"]
-            # Use latency vs cold baseline as cache signal (cached_tokens not
-            # surfaced by the Microsoft Foundry gateway for this model)
-            cache_note = (
-                f"WARM ({speedup:.1f}× faster than cold)"
-                if result["latency_s"] < cold_ms * 0.85
-                else "WARM (prompt_cache_key active)"
-            )
+            # cached_tokens is the authoritative signal; latency is only a
+            # fallback when the gateway does not report usage details.
+            if result["cached_tokens"] > 0:
+                cache_note = f"WARM ({result['cache_hit_pct']}% cached)"
+            elif result["latency_s"] < cold_ms * 0.85:
+                cache_note = f"LIKELY WARM ({cold_ms / result['latency_s']:.1f}× faster than cold)"
+            else:
+                cache_note = "COLD (0 cached tokens)"
             print(
                 f"  Call {i+1}: [{result['label']:<6}]  {fmt_ms(result['latency_s']):>7}  "
                 f"[{cache_note}]  \"{result['user_text'][:48]}\""
@@ -456,7 +482,8 @@ def print_summary():
         ("Feature",             "GPT-5.6-sol",                     "FW-Kimi-K3-3"),
         ("API",                 "Responses API",                   "Chat Completions"),
         ("Caching mechanism",   "prompt_cache_breakpoint field",   "prompt_cache_key body field"),
-        ("Explicit breakpoint", "Yes — marks boundary in content", "Yes — names the cache bucket"),
+        ("Explicit breakpoint", "Yes — marks boundary in content", "No — automatic prefix match"),
+        ("Routing",             "Server-managed",                  "Key pins to same replica(s)"),
         ("Client change",       "Add field to each request",       "Add field to each request"),
         ("Cache scope",         "Server-managed (24h retention)",  "Server-managed KV cache"),
         ("Cold call",           "Full prompt encoded",             "Full prompt encoded"),
@@ -475,14 +502,13 @@ def print_summary():
         "  ─────────────────────────────────────────────────────────────────────\n"
         "  prompt_cache_key is the Fireworks equivalent of prompt_cache_breakpoint.\n"
         "  Set it to a stable string (e.g. 'safety-classifier-v1') in the\n"
-        "  request body and Fireworks caches the system-prompt prefix under that\n"
-        "  key — no sticky routing, no header changes, no model-side support needed.\n"
+        "  request body; requests sharing the key route to the same replica(s),\n"
+        "  where the system-prompt prefix is already cached. No header changes.\n"
         "\n"
-        "  For this classifier workload (same system prompt, millions of short\n"
-        "  user messages): one shared prompt_cache_key across all classification\n"
-        "  requests ensures every call after the first warm write pays only for\n"
-        "  the short user message — same latency and cost savings as an explicit\n"
-        "  prompt_cache_breakpoint.\n"
+        "  Production scale (millions of short messages): KV cache is\n"
+        "  replica-local, so a single key concentrates load on a few replicas.\n"
+        "  Shard it into N buckets (e.g. 'safety-classifier-v1-0'..'-N') so each\n"
+        "  bucket warms its own replica and throughput scales out.\n"
     )
 
 
